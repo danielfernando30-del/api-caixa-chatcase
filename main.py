@@ -24,18 +24,21 @@ def resultados(
         raise HTTPException(status_code=400, detail="Loteria inválida")
 
     return {
-        "data": {
-            "dataApuracao": "03/02/2026",
-            "concurso": "3602",
-            "sorteio": [
-                "01","02","03","04","05",
-                "06","08","09","15","18",
-                "19","20","22","23","24"
-            ],
-            "proximoConcurso": {
-                "numero": "3603",
-                "data": "05/02/2026",
-                "valorEstimado": "5000000.00"
+            sorteio = [
+        "01","02","03","04","05",
+        "06","08","09","15","18",
+        "19","20","22","23","24"
+    ]
+
+    return {
+        "dataApuracao": "03/02/2026",
+        "concurso": "3602",
+        "sorteioTexto": " ".join([f"[{n}]" for n in sorteio]),
+        "proxNumero": "3603",
+        "proxData": "05/02/2026",
+        "proxValorEstimado": "5000000.00"
+    }
+
             }
         }
     }
