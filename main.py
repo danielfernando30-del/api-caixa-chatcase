@@ -3,22 +3,57 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
 import time
-import httpx
 
 app = FastAPI()
 
-# No Render: Environment -> add KEY=TOKEN VALUE=seu_token
+# Token que o Chatcase usa (Render -> ENV TOKEN)
 TOKEN = os.getenv("TOKEN", "SEU_TOKEN_SECRETO_AQUI")
 
-BASE_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api"
+# Token apenas para atualizar cache (Render -> ENV ADMIN_TOKEN)
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "SEU_ADMIN_TOKEN_AQUI")
 
-# Cache simples em memória: { "lotofacil": {"ts":..., "payload": {...}} }
+# Cache em memória
 CACHE: dict[str, dict] = {}
-CACHE_TTL_SECONDS = 120  # 2 min (ajuste como quiser)
+CACHE_META: dict[str, dict] = {}
+
+SUPPORTED = {"lotofacil", "megasena", "quina"}
 
 
-class RequestBody(BaseModel):
+class ReqResultados(BaseModel):
     loteria: str
+
+
+class ReqAtualizar(BaseModel):
+    loteria: str
+    data: dict  # payload completo já pronto
+
+
+def build_message(loteria: str, data: dict) -> str:
+    titulo = {"lotofacil": "Lotofácil", "megasena": "Mega-Sena", "quina": "Quina"}.get(loteria, loteria)
+
+    data_apuracao = data.get("dataApuracao", "")
+    concurso = data.get("concurso", "")
+    sorteio_texto = data.get("sorteioTexto", "")
+    acumulado = bool(data.get("acumulado", False))
+
+    prox = data.get("proximoConcurso", {}) or {}
+    prox_numero = prox.get("numero", "")
+    prox_data = prox.get("data", "")
+    prox_valor = prox.get("valorEstimado", "")
+
+    acumulado_txt = "✅ *Acumulou!*" if acumulado else "ℹ️ *Não acumulou.*"
+
+    return (
+        f"📌 *Anote o resultado da {titulo}*\n\n"
+        f"📅 Data: {data_apuracao}\n"
+        f"🔢 Concurso: {concurso}\n\n"
+        f"🎯 Números sorteados:\n{sorteio_texto}\n\n"
+        f"➡️ *Próximo concurso*\n"
+        f"📆 Data: {prox_data}\n"
+        f"🔢 Concurso: {prox_numero}\n"
+        f"💰 Estimativa: R$ {prox_valor}\n"
+        f"{acumulado_txt}"
+    )
 
 
 @app.get("/")
@@ -26,160 +61,65 @@ def health():
     return {"status": "ok"}
 
 
-def format_brl(value) -> str:
-    """Formata número para pt-BR simples: 1800000 -> 1.800.000,00"""
-    try:
-        v = float(value)
-        return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return str(value)
+@app.post("/caixa/atualizar")
+def atualizar_cache(
+    payload: ReqAtualizar,
+    authorization: str | None = Header(default=None),
+):
+    """
+    Endpoint para um 'worker' externo (seu PC/VPS) enviar os resultados.
+    Use: Authorization: Bearer <ADMIN_TOKEN>
+    """
+    if not authorization or authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
+    loteria = (payload.loteria or "").strip().lower()
+    if loteria not in SUPPORTED:
+        raise HTTPException(status_code=400, detail="Loteria inválida")
 
-def build_message(data: dict) -> str:
-    """Monta mensagem pronta para WhatsApp."""
-    lot = (data.get("loteria") or "").lower()
-    titulo = "Lotofácil" if lot == "lotofacil" else lot.title()
+    data = payload.data or {}
+    # garante mensagem pronta
+    data["mensagem"] = build_message(loteria, data)
 
-    acumulado = data.get("acumulado", False)
-    acumulado_txt = "✅ *Acumulou!*" if acumulado else "ℹ️ *Não acumulou.*"
+    CACHE[loteria] = data
+    CACHE_META[loteria] = {"updated_at": int(time.time())}
 
-    msg = (
-        f"📌 *Anote o resultado da {titulo}*\n\n"
-        f"📅 Data: {data.get('dataApuracao','')}\n"
-        f"🔢 Concurso: {data.get('concurso','')}\n\n"
-        f"🎯 Números sorteados:\n{data.get('sorteioTexto','')}\n\n"
-        f"➡️ *Próximo concurso*\n"
-        f"📆 Data: {data.get('proximoConcurso',{}).get('data','')}\n"
-        f"🔢 Concurso: {data.get('proximoConcurso',{}).get('numero','')}\n"
-        f"💰 Estimativa: R$ {data.get('proximoConcurso',{}).get('valorEstimado','')}\n"
-        f"{acumulado_txt}"
-    )
-    return msg
-
-
-async def fetch_lotofacil_official() -> dict:
-    """Busca resultado oficial da Lotofácil via servicebus2 (CAIXA)."""
-    url = f"{BASE_URL}/lotofacil"
-
-    # Headers mais "humanos" (às vezes evita 403)
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/121.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-        "Referer": "https://loterias.caixa.gov.br/",
-        "Origin": "https://loterias.caixa.gov.br",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-
-    async with httpx.AsyncClient(
-        timeout=20.0, headers=headers, follow_redirects=True
-    ) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        j = r.json()
-
-    # Campos típicos do servicebus2
-    concurso = j.get("numero")
-    data_apuracao = j.get("dataApuracao")
-    dezenas = j.get("listaDezenas") or []
-
-    prox_numero = j.get("numeroConcursoProximo")
-    prox_data = j.get("dataProximoConcurso")
-    prox_valor = j.get("valorEstimadoProximoConcurso")
-
-    acumulado = j.get("acumulado")
-
-    sorteio_texto = " ".join([f"[{d}]" for d in dezenas])
-    prox_valor_fmt = format_brl(prox_valor)
-
-    payload = {
-        "loteria": "lotofacil",
-        "concurso": str(concurso) if concurso is not None else "",
-        "dataApuracao": data_apuracao or "",
-        "sorteio": dezenas,
-        "sorteioTexto": sorteio_texto,
-        "acumulado": bool(acumulado),
-        "proximoConcurso": {
-            "numero": str(prox_numero) if prox_numero is not None else "",
-            "data": prox_data or "",
-            "valorEstimado": prox_valor_fmt,
-        },
-    }
-
-    payload["mensagem"] = build_message(payload)
-    return payload
-
-
-def get_cache(loteria: str) -> dict | None:
-    item = CACHE.get(loteria)
-    if not item:
-        return None
-    if time.time() - item["ts"] > CACHE_TTL_SECONDS:
-        return None
-    return item["payload"]
-
-
-def set_cache(loteria: str, payload: dict) -> None:
-    CACHE[loteria] = {"ts": time.time(), "payload": payload}
+    return {"status": "ok", "loteria": loteria, "updated_at": CACHE_META[loteria]["updated_at"]}
 
 
 @app.post("/caixa/resultados")
-async def resultados(
-    body: RequestBody,
+def resultados(
+    body: ReqResultados,
     authorization: str | None = Header(default=None),
 ):
-    # --- Auth ---
+    """
+    Endpoint que o Chatcase chama.
+    Use: Authorization: Bearer <TOKEN>
+    Body: {"loteria":"lotofacil"}
+    """
     if not authorization or authorization != f"Bearer {TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     loteria = (body.loteria or "").strip().lower()
-    if loteria != "lotofacil":
+    if loteria not in SUPPORTED:
         raise HTTPException(status_code=400, detail="Loteria inválida")
 
-    # --- Cache primeiro (resposta rápida) ---
-    cached = get_cache(loteria)
-    if cached:
-        return JSONResponse({"data": cached})
+    data = CACHE.get(loteria)
+    meta = CACHE_META.get(loteria, {})
 
-    # --- Busca oficial ---
-    try:
-        payload = await fetch_lotofacil_official()
-        set_cache(loteria, payload)
-        return JSONResponse({"data": payload})
-
-    except httpx.HTTPStatusError as e:
-        # Se a CAIXA bloquear (403) ou der qualquer erro http,
-        # tente retornar o último cache mesmo expirado (se existir)
-        last = CACHE.get(loteria, {}).get("payload")
-        if last:
-            last_copy = dict(last)
-            last_copy["alerta"] = f"Consulta CAIXA falhou ({e.response.status_code}). Retornando último resultado em cache."
-            last_copy["mensagem"] = (
-                last_copy.get("mensagem", "")
-                + "\n\n⚠️ *Obs:* Consulta ao portal CAIXA falhou agora; mostrando último resultado disponível."
-            )
-            return JSONResponse({"data": last_copy})
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Falha ao consultar CAIXA: {e.response.status_code} {e.response.reason_phrase}",
+    if not data:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "data": {
+                    "mensagem": "⚠️ Ainda não tenho um resultado salvo para essa loteria. Tente novamente em instantes.",
+                    "status_cache": "empty",
+                },
+                "meta": meta,
+            },
         )
 
-    except Exception as e:
-        # Erro genérico
-        last = CACHE.get(loteria, {}).get("payload")
-        if last:
-            last_copy = dict(last)
-            last_copy["alerta"] = "Erro inesperado ao consultar CAIXA. Retornando último resultado em cache."
-            last_copy["mensagem"] = (
-                last_copy.get("mensagem", "")
-                + "\n\n⚠️ *Obs:* Erro inesperado na consulta; mostrando último resultado disponível."
-            )
-            return JSONResponse({"data": last_copy})
-
-        raise HTTPException(status_code=502, detail=f"Erro inesperado: {e}")
+    return JSONResponse(
+        status_code=200,
+        content={"data": data, "meta": meta},
+    )
