@@ -6,13 +6,9 @@ import time
 
 app = FastAPI()
 
-# Token que o Chatcase usa (Render -> ENV TOKEN)
 TOKEN = os.getenv("TOKEN", "SEU_TOKEN_SECRETO_AQUI")
-
-# Token apenas para atualizar cache (Render -> ENV ADMIN_TOKEN)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "SEU_ADMIN_TOKEN_AQUI")
 
-# Cache em memória
 CACHE: dict[str, dict] = {}
 CACHE_META: dict[str, dict] = {}
 
@@ -25,7 +21,7 @@ class ReqResultados(BaseModel):
 
 class ReqAtualizar(BaseModel):
     loteria: str
-    data: dict  # payload completo já pronto
+    data: dict
 
 
 def build_message(loteria: str, data: dict) -> str:
@@ -66,10 +62,6 @@ def atualizar_cache(
     payload: ReqAtualizar,
     authorization: str | None = Header(default=None),
 ):
-    """
-    Endpoint para um 'worker' externo (seu PC/VPS) enviar os resultados.
-    Use: Authorization: Bearer <ADMIN_TOKEN>
-    """
     if not authorization or authorization != f"Bearer {ADMIN_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -78,7 +70,6 @@ def atualizar_cache(
         raise HTTPException(status_code=400, detail="Loteria inválida")
 
     data = payload.data or {}
-    # garante mensagem pronta
     data["mensagem"] = build_message(loteria, data)
 
     CACHE[loteria] = data
@@ -92,11 +83,6 @@ def resultados(
     body: ReqResultados,
     authorization: str | None = Header(default=None),
 ):
-    """
-    Endpoint que o Chatcase chama.
-    Use: Authorization: Bearer <TOKEN>
-    Body: {"loteria":"lotofacil"}
-    """
     if not authorization or authorization != f"Bearer {TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -119,7 +105,4 @@ def resultados(
             },
         )
 
-    return JSONResponse(
-        status_code=200,
-        content={"data": data, "meta": meta},
-    )
+    return JSONResponse(status_code=200, content={"data": data, "meta": meta})
